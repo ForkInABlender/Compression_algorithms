@@ -1,420 +1,294 @@
-from __future__ import annotations
-
-import struct
-import zlib
-from typing import Iterator
-
 import numpy as np
 
 
-TOTAL = 9_000_000_000_000
-CHUNK = 1_000_000
-
-MAGIC = b"F64C2"
-
-EMPTY = 0
-CONSTANT = 1
-ARITHMETIC = 2
-COMPRESSED = 3
-RAW = 4
+MASK64 = (1 << 64) - 1
+EMPTY = np.uint64(MASK64)
 
 
-def compact_float64(a: np.ndarray) -> bytes:
+class VirtualFloat64Array:
     """
-    Losslessly compact a contiguous float64 NumPy array.
+    Sparse virtual float64 array.
+
+    The logical array may be extremely large, but every element is
+    implicitly 0.0 until explicitly assigned.
+
+    Nonzero values are stored in a single contiguous open-addressing
+    hash table. No Python dictionary and no chunking are used.
     """
 
-    a = np.asarray(a, dtype=np.float64)
+    def __init__(self, size, seed=0, initial_capacity=16):
+        size = int(size)
 
-    if not a.flags.c_contiguous:
-        a = np.ascontiguousarray(a)
+        if size < 0:
+            raise ValueError("size must be non-negative")
 
-    n = a.size
-
-    if n == 0:
-        return (
-            MAGIC +
-            bytes([EMPTY]) +
-            struct.pack("<Q", 0)
-        )
-
-    # ------------------------------------------------------------
-    # Constant representation.
-    #
-    # Compare the actual uint64 bit pattern so that:
-    #
-    #     +0.0 != -0.0
-    #
-    # and different NaN payloads remain distinguishable.
-    # ------------------------------------------------------------
-
-    bits = a.view(np.uint64)
-
-    if np.all(bits == bits[0]):
-        return (
-            MAGIC +
-            bytes([CONSTANT]) +
-            struct.pack(
-                "<QQ",
-                n,
-                int(bits[0])
-            )
-        )
-
-    # ------------------------------------------------------------
-    # Arithmetic progression.
-    # ------------------------------------------------------------
-
-    if n >= 2 and np.isfinite(a).all():
-
-        start = a[0]
-        step = a[1] - a[0]
-
-        expected = (
-            start +
-            step * np.arange(
-                n,
-                dtype=np.float64
-            )
-        )
-
-        if np.array_equal(a, expected):
-            return (
-                MAGIC +
-                bytes([ARITHMETIC]) +
-                struct.pack(
-                    "<Qdd",
-                    n,
-                    float(start),
-                    float(step)
-                )
-            )
-
-    # ------------------------------------------------------------
-    # Generic lossless compression.
-    # ------------------------------------------------------------
-
-    raw = a.tobytes(order="C")
-
-    compressed = zlib.compress(
-        raw,
-        level=9
-    )
-
-    if len(compressed) < len(raw):
-        return (
-            MAGIC +
-            bytes([COMPRESSED]) +
-            struct.pack(
-                "<QQ",
-                n,
-                len(compressed)
-            ) +
-            compressed
-        )
-
-    # ------------------------------------------------------------
-    # Incompressible data.
-    # ------------------------------------------------------------
-
-    return (
-        MAGIC +
-        bytes([RAW]) +
-        struct.pack("<Q", n) +
-        raw
-    )
-
-
-def expand_float64(blob: bytes) -> np.ndarray:
-    """
-    Reconstruct one compacted chunk as a NumPy float64 ndarray.
-    """
-
-    if blob[:5] != MAGIC:
-        raise ValueError("invalid compact float64 object")
-
-    kind = blob[5]
-
-    # EMPTY
-    if kind == EMPTY:
-        return np.empty(
-            0,
-            dtype=np.float64
-        )
-
-    # CONSTANT
-    if kind == CONSTANT:
-
-        n, bits = struct.unpack_from(
-            "<QQ",
-            blob,
-            6
-        )
-
-        result = np.empty(
-            n,
-            dtype=np.float64
-        )
-
-        result.view(np.uint64)[:] = bits
-
-        return result
-
-    # ARITHMETIC
-    if kind == ARITHMETIC:
-
-        n, start, step = struct.unpack_from(
-            "<Qdd",
-            blob,
-            6
-        )
-
-        return (
-            start +
-            step *
-            np.arange(
-                n,
-                dtype=np.float64
-            )
-        )
-
-    # COMPRESSED
-    if kind == COMPRESSED:
-
-        n, compressed_size = struct.unpack_from(
-            "<QQ",
-            blob,
-            6
-        )
-
-        offset = 22
-
-        compressed = blob[
-            offset:
-            offset + compressed_size
-        ]
-
-        raw = zlib.decompress(compressed)
-
-        if len(raw) != n * 8:
-            raise ValueError(
-                "corrupt compressed float64 chunk"
-            )
-
-        return np.frombuffer(
-            raw,
-            dtype=np.float64
-        ).copy()
-
-    # RAW
-    if kind == RAW:
-
-        n = struct.unpack_from(
-            "<Q",
-            blob,
-            6
-        )[0]
-
-        offset = 14
-
-        raw = blob[
-            offset:
-            offset + n * 8
-        ]
-
-        if len(raw) != n * 8:
-            raise ValueError(
-                "corrupt raw float64 chunk"
-            )
-
-        return np.frombuffer(
-            raw,
-            dtype=np.float64
-        ).copy()
-
-    raise ValueError(
-        f"unknown representation: {kind}"
-    )
-
-
-class CompactFloat64Array:
-    """
-    Logical NumPy-compatible float64 array.
-
-    Only requested chunks are materialized.
-    """
-
-    def __init__(
-        self,
-        length: int,
-        chunk_size: int = 1_000_000,
-    ):
-        self.length = int(length)
-        self.chunk_size = int(chunk_size)
-
-        if self.length < 0:
-            raise ValueError("negative length")
-
-        if self.chunk_size <= 0:
-            raise ValueError("invalid chunk size")
-
-        self.shape = (self.length,)
+        self.shape = (size,)
         self.dtype = np.dtype(np.float64)
-        self.ndim = 1
+        self.seed = int(seed) & MASK64
 
-        self._chunks: dict[int, bytes] = {}
+        capacity = 1
 
-    def store_chunk(
-        self,
-        offset: int,
-        values: np.ndarray,
-    ) -> None:
+        while capacity < max(4, int(initial_capacity)):
+            capacity <<= 1
 
-        values = np.asarray(
-            values,
-            dtype=np.float64
+        self._keys = np.full(
+            capacity,
+            EMPTY,
+            dtype=np.uint64,
         )
 
-        offset = int(offset)
-
-        if offset < 0:
-            raise IndexError(offset)
-
-        if offset + values.size > self.length:
-            raise IndexError(
-                "chunk exceeds logical array"
-            )
-
-        self._chunks[offset] = compact_float64(
-            values
+        self._vals = np.empty(
+            capacity,
+            dtype=np.float64,
         )
 
-    def get_chunk(
-        self,
-        offset: int,
-    ) -> np.ndarray:
+        self._count = 0
 
-        offset = int(offset)
+    @property
+    def size(self):
+        return self.shape[0]
 
-        if offset < 0 or offset >= self.length:
-            raise IndexError(offset)
+    @property
+    def ndim(self):
+        return 1
 
-        blob = self._chunks.get(offset)
+    @property
+    def nbytes(self):
+        # Logical size, not physical allocation.
+        return self.size * 8
 
-        if blob is None:
-            raise KeyError(
-                f"chunk {offset} has not been stored"
-            )
+    @property
+    def stored_nbytes(self):
+        # Physical memory occupied by the sparse table.
+        return self._keys.nbytes + self._vals.nbytes
 
-        return expand_float64(blob)
+    @property
+    def stored_count(self):
+        return self._count
 
-    def __getitem__(self, key):
+    def _normalize_index(self, index):
+        i = int(index)
 
-        # Single element.
-        if isinstance(key, (int, np.integer)):
+        if i < 0:
+            i += self.size
 
-            index = int(key)
+        if i < 0 or i >= self.size:
+            raise IndexError("index out of bounds")
 
-            if index < 0:
-                index += self.length
+        return i
 
-            if index < 0 or index >= self.length:
-                raise IndexError(index)
+    @staticmethod
+    def _hash(x):
+        """
+        64-bit SplitMix-style integer hash.
+        """
+        x = (x + 0x9E3779B97F4A7C15) & MASK64
 
-            chunk_offset = (
-                index //
-                self.chunk_size
-            ) * self.chunk_size
+        x ^= x >> 30
+        x = (x * 0xBF58476D1CE4E5B9) & MASK64
 
-            chunk = self.get_chunk(
-                chunk_offset
-            )
+        x ^= x >> 27
+        x = (x * 0x94D049BB133111EB) & MASK64
 
-            return chunk[
-                index - chunk_offset
-            ]
+        x ^= x >> 31
 
-        # Slice.
-        if isinstance(key, slice):
+        return x & MASK64
 
-            start, stop, step = key.indices(
-                self.length
-            )
+    def _find_slot(self, key):
+        mask = len(self._keys) - 1
+        pos = self._hash(key) & mask
+
+        while True:
+            existing = int(self._keys[pos])
+
+            if existing == MASK64:
+                return pos, False
+
+            if existing == key:
+                return pos, True
+
+            pos = (pos + 1) & mask
+
+    def _resize(self, new_capacity):
+        old_keys = self._keys
+        old_vals = self._vals
+
+        self._keys = np.full(
+            new_capacity,
+            EMPTY,
+            dtype=np.uint64,
+        )
+
+        self._vals = np.empty(
+            new_capacity,
+            dtype=np.float64,
+        )
+
+        old_count = self._count
+        self._count = 0
+
+        for pos in range(len(old_keys)):
+            key = int(old_keys[pos])
+
+            if key != MASK64:
+                slot, found = self._find_slot(key)
+
+                self._keys[slot] = np.uint64(key)
+                self._vals[slot] = old_vals[pos]
+
+                self._count += 1
+
+        if self._count != old_count:
+            raise RuntimeError("hash table resize corruption")
+
+    def _ensure_capacity(self):
+        # Keep load factor <= 0.5.
+        if (self._count + 1) * 2 >= len(self._keys):
+            self._resize(len(self._keys) * 2)
+
+    def _get_stored(self, i):
+        slot, found = self._find_slot(i)
+
+        if found:
+            return self._vals[slot]
+
+        return np.float64(0.0)
+
+    def _set_stored(self, i, value):
+        value = np.float64(value)
+
+        slot, found = self._find_slot(i)
+
+        if value == 0.0:
+            if found:
+                self._delete_slot(slot)
+            return
+
+        if found:
+            self._vals[slot] = value
+            return
+
+        self._ensure_capacity()
+
+        slot, found = self._find_slot(i)
+
+        if found:
+            self._vals[slot] = value
+            return
+
+        self._keys[slot] = np.uint64(i)
+        self._vals[slot] = value
+        self._count += 1
+
+    def _delete_slot(self, slot):
+        """
+        Delete from an open-addressing table while preserving
+        probe chains.
+        """
+        mask = len(self._keys) - 1
+
+        self._keys[slot] = EMPTY
+        self._count -= 1
+
+        pos = (slot + 1) & mask
+
+        while self._keys[pos] != EMPTY:
+            key = int(self._keys[pos])
+            value = self._vals[pos]
+
+            self._keys[pos] = EMPTY
+            self._count -= 1
+
+            new_slot, found = self._find_slot(key)
+
+            if found:
+                raise RuntimeError(
+                    "hash table deletion corruption"
+                )
+
+            self._keys[new_slot] = np.uint64(key)
+            self._vals[new_slot] = value
+            self._count += 1
+
+            pos = (pos + 1) & mask
+
+    def __getitem__(self, index):
+        if isinstance(index, (int, np.integer)):
+            i = self._normalize_index(index)
+            return self._get_stored(i)
+
+        if isinstance(index, slice):
+            start, stop, step = index.indices(self.size)
 
             if step != 1:
-                return np.array(
-                    [
-                        self[i]
-                        for i in range(
-                            start,
-                            stop,
-                            step
-                        )
-                    ],
-                    dtype=np.float64
+                raise ValueError(
+                    "only contiguous slices are supported"
                 )
 
-            if start >= stop:
-                return np.empty(
-                    0,
-                    dtype=np.float64
-                )
+            count = max(0, stop - start)
 
-            pieces = []
+            result = np.zeros(
+                count,
+                dtype=np.float64,
+            )
 
-            position = start
+            for j, i in enumerate(range(start, stop)):
+                result[j] = self._get_stored(i)
 
-            while position < stop:
-
-                chunk_offset = (
-                    position //
-                    self.chunk_size
-                ) * self.chunk_size
-
-                chunk = self.get_chunk(
-                    chunk_offset
-                )
-
-                local_start = (
-                    position -
-                    chunk_offset
-                )
-
-                local_stop = min(
-                    chunk.size,
-                    stop - chunk_offset
-                )
-
-                pieces.append(
-                    chunk[
-                        local_start:
-                        local_stop
-                    ]
-                )
-
-                position = (
-                    chunk_offset +
-                    local_stop
-                )
-
-            return np.concatenate(pieces)
+            return result
 
         raise TypeError(
             "index must be an integer or slice"
         )
 
-    def iter_chunks(self) -> Iterator[np.ndarray]:
+    def __setitem__(self, index, value):
+        if isinstance(index, (int, np.integer)):
+            i = self._normalize_index(index)
+            self._set_stored(i, value)
+            return
 
-        offset = 0
+        if isinstance(index, slice):
+            start, stop, step = index.indices(self.size)
 
-        while offset < self.length:
+            if step != 1:
+                raise ValueError(
+                    "only contiguous slices are supported"
+                )
 
-            yield self.get_chunk(offset)
+            count = max(0, stop - start)
 
-            offset += self.chunk_size
+            if np.isscalar(value):
+                value = np.float64(value)
 
-    def stored_bytes(self) -> int:
-        return sum(
-            len(blob)
-            for blob in self._chunks.values()
+                for i in range(start, stop):
+                    self._set_stored(i, value)
+
+                return
+
+            values = np.asarray(
+                value,
+                dtype=np.float64,
+            )
+
+            if values.ndim != 1:
+                raise ValueError(
+                    "assigned array must be one-dimensional"
+                )
+
+            if values.size != count:
+                raise ValueError(
+                    f"could not broadcast input array from "
+                    f"shape {values.shape} into shape ({count},)"
+                )
+
+            for i, v in zip(
+                range(start, stop),
+                values,
+            ):
+                self._set_stored(i, v)
+
+            return
+
+        raise TypeError(
+            "index must be an integer or slice"
         )
