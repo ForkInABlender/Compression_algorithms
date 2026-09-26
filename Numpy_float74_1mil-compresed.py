@@ -1,3 +1,14 @@
+# Dylan Kenneth Eliot
+
+"""
+This works by compressing the datageam down from 8 mb to 0.74 mb given multiple
+ types of cardinality.
+ 
+ Because it reaches the final entropy with 92.3% efficiency,
+  'objective notation don't compress further down, it only walls'.
+
+"""
+
 import io
 import math
 import numpy as np
