@@ -7,6 +7,16 @@ This works by compressing the datageam down from 8 mb to 0.74 mb given multiple
  Because it reaches the final entropy with 92.3% efficiency,
   'objective notation don't compress further down, it only walls'.
 
+ The project itself was also based on cheaply holding 1 million float64
+  values as an array compressed and compacted down, I made sure compression was lossless.
+
+ Keep in mind, this was designed around np.float64, so adapting it for np.float32 
+  arrays of the same box depth should take up significantly half the time.
+
+Normally, this would not matter. unless you encode all your string data as np.float(64/32)
+ numbers per character.
+
+
 """
 
 import io
