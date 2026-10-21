@@ -8,6 +8,7 @@ This code was modeled for web apps like ipchat.in/kubernetes via katavm so the s
  If they don't have the room number or key strata, data lost. Same goes for the "username" assignment.
 
  If fleshed out further, this can be used to keep chat apps secure more than RSA/TSL/SSL could.
+ '''
 
 import os
 import secrets
