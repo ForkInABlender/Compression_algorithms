@@ -1,5 +1,13 @@
-#!/usr/bin/env python3
-"""Generate a cryptographically random seed and numeric username."""
+# Dylan Kenneth Eliot
+
+'''
+
+This code was modeled for web apps like ipchat.in/kubernetes via katavm so the stack remained secure regardless of runtime deadlocking and hardware throttling.
+ At no point does it make it easier to violate each tech stack but harder.
+
+ If they don't have the room number or key strata, data lost. Same goes for the "username" assignment.
+
+ If fleshed out further, this can be used to keep chat apps secure more than RSA/TSL/SSL could.
 
 import os
 import secrets
